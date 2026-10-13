@@ -30,7 +30,7 @@ from .addon_manager import (
 )
 from .consent_prompt import maybe_prompt_for_consent
 from .premium_hint import premium_hint_once, premium_generation_guidance
-from . import blender_scripts, context_log, generation
+from . import blender_scripts, config, context_log, generation, http_services
 from .safe_mode import safe_mode_enabled, validate_code, SandboxViolation, SAFE_MODE_ENV
 from .openai_apps import (
     APP_MIME_TYPE,
@@ -468,7 +468,13 @@ Objects can also come from existing libraries (search_assets, then import_asset:
 Sketchfab, Poly Pizza) or be made to order (generate_3d: one new textured model from text or an
 image, 1-3 minutes, may cost the user a credit). A generation is one object, never a whole
 scene, the ground or parts to assemble. Imported and generated models arrive at arbitrary
-scale: use the reported world_bounding_box to size them and put them on the ground."""
+scale: use the reported world_bounding_box to size them and put them on the ground.
+
+When the server runs over HTTP (get_addon_status then reports http_services), it also serves
+a browser: /preview is a live page of the current scene (screenshot, upload, downloads) that
+you can hand to the user once a design is worth looking at; POST /upload/{filename} brings an
+outside asset to Blender's machine for import_file; export_scene and render_scene results
+carry /files download links. In stdio mode none of this exists, so don't promise it."""
 
 # Create the MCP server with lifespan support
 mcp = FastMCP(
@@ -581,6 +587,11 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
 
     `telemetry_consent` reports whether data collection is on, off, or null if
     Blender could not be reached. Use it to answer telemetry status questions.
+
+    `ui_language` / `translate_new_dataname` report Blender's UI language and
+    whether new data names get localized. execute_code always runs with
+    new-data-name translation off, so node names it creates stay English
+    (e.g. "Principled BSDF") regardless of the UI language.
     """
     try:
         blender = get_blender_connection()
@@ -598,6 +609,8 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
             "addon_version": result.addon_version,
             "capabilities": result.capabilities,
             "blender_version": result.blender_version,
+            "ui_language": getattr(result, "ui_language", None),
+            "translate_new_dataname": getattr(result, "translate_new_dataname", None),
             "premium_generators": result.premium_generators,
             **_integrations(blender, result.premium_generators),
             "source": result.source,
@@ -609,6 +622,8 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
                 "disable/enable 'Interface: Blender MCP', or restart Blender, then Start MCP Server."
             ),
         }
+        if http_services.active():
+            payload["http_services"] = http_services.urls()
         return (json.dumps(payload, indent=2) + premium_generation_guidance(result.premium_generators)
                 + await maybe_prompt_for_consent(ctx))
     except Exception as e:
@@ -807,7 +822,7 @@ def _capture_viewport(max_size: int) -> tuple[bytes, dict]:
     file and scene it shows.
     """
     blender = get_blender_connection()
-    temp_path = os.path.join(tempfile.gettempdir(), f"blender_screenshot_{os.getpid()}.png")
+    temp_path = str(config.capture_dir() / f"blender_screenshot_{os.getpid()}.png")
 
     result = blender.send_command("get_viewport_screenshot", {
         "max_size": max_size,
@@ -823,7 +838,8 @@ def _capture_viewport(max_size: int) -> tuple[bytes, dict]:
 
     with open(temp_path, 'rb') as f:
         image_bytes = f.read()
-    os.remove(temp_path)
+    if not config.captures_persistent():
+        os.remove(temp_path)
     return image_bytes, result
 
 
@@ -1773,14 +1789,192 @@ class _LookRefused(Exception):
 
 
 def _look_via_script(args: dict) -> CallToolResult:
-    path = os.path.join(tempfile.gettempdir(), f"blender_look_{os.getpid()}.png")
+    path = str(config.capture_dir() / f"blender_look_{os.getpid()}.png")
     info = _run_script(blender_scripts.LOOK, {**args, "filepath": path})
     if info.get("error"):
         raise _LookRefused(info["error"])
     with open(path, "rb") as f:
         png = f.read()
-    os.remove(path)
+    if not config.captures_persistent():
+        os.remove(path)
     return CallToolResult(content=[_png_content(png), TextContent(type="text", text=_look_caption(info))])
+
+
+@mcp.tool()
+@trajectory_tool("export_scene")
+async def export_scene(
+    ctx: Context,
+    object_names: list[str] | None = None,
+    format: str = "glb",
+    selection_only: bool = False,
+    apply_modifiers: bool = True,
+    filepath: str | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Export the scene, the current selection, or named objects to GLB or FBX, for use
+    outside Blender: game engines, viewers, sharing the result.
+
+    Files land in the server's managed exports folder, which the /files HTTP endpoint
+    serves for download; the result carries the link when HTTP services are on (URLs in
+    get_addon_status). Pass filepath= to write anywhere else on Blender's machine.
+
+    Parameters:
+    - object_names: Objects to export, children included. Default: the whole scene.
+    - format: "glb" (PBR materials, emission, skins, shape keys, animation) or "fbx".
+    - selection_only: Export whatever is selected right now, instead of object_names.
+    - apply_modifiers: False keeps rigs and shape keys intact.
+    - filepath: Write here instead of the managed exports folder.
+    - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
+    """
+    fmt = (format or "glb").lower()
+    if fmt not in ("glb", "fbx"):
+        return f"Error: format must be glb or fbx, got {format!r}"
+    if filepath is None:
+        filepath = str(http_services.managed_path(
+            "exports", f"scene_{time.strftime('%Y%m%d_%H%M%S')}.{fmt}"))
+    try:
+        result = get_blender_connection().send_command("export_scene", {
+            "filepath": filepath,
+            "format": fmt,
+            "object_names": object_names,
+            "selection_only": selection_only,
+            "apply_modifiers": apply_modifiers,
+        })
+    except Exception as e:
+        if _addon_lacks(e):
+            return f"export_scene needs a newer addon. {ADDON_UPDATE_HINT}"
+        return f"Error exporting: {e}"
+    if "error" in result:
+        return f"Error: {result['error']}"
+    lines = [f"Exported {', '.join(result.get('exported', []))} to "
+             f"{result.get('path', filepath)} ({result.get('bytes', 0)} bytes)."]
+    url = http_services.download_url(result.get("path", filepath))
+    if url:
+        lines.append(f"Download: {url}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@trajectory_tool("render_scene")
+async def render_scene(
+    ctx: Context,
+    views: list[str | list[float]] | None = None,
+    target: list[str] | None = None,
+    distance: float | None = None,
+    engine: str | None = None,
+    resolution: list[int] | None = None,
+    samples: int | None = None,
+    max_size: int = 1024,
+    user_prompt: str = "",
+) -> CallToolResult:
+    """
+    Render the scene from several sides with the scene's own render engine — the real
+    final image (lighting, depth of field, denoising), not a viewport approximation.
+    Cycles included.
+
+    Each full-size PNG lands in the managed renders folder with a download link, and a
+    downscaled copy of each is attached here to judge. A render must finish within the
+    three-minute command timeout, so cap samples for Cycles.
+
+    Parameters:
+    - views: Up to 6 of front, back, left, right, top, three_quarter, or [x, y, z]
+      directions from the target towards the eye. Default: front, right, top, three_quarter.
+    - target: Objects to frame, children included. Default: every visible object.
+    - distance: Metres from the target's centre to the camera. Default: far enough to fit.
+    - engine: "cycles", "eevee", "workbench" or an exact engine id. Default: the scene's.
+    - resolution: [width, height] in pixels. Default: the scene's render resolution.
+    - samples: Render samples (Cycles or EEVEE). Default: the scene's.
+    - max_size: Longest side in pixels of the copies shown here; full-size renders are
+      always written to disk. 0 skips the copies.
+    - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
+    """
+    for v in views or []:
+        if isinstance(v, str) and v not in LOOK_ANGLES:
+            return _app_error(f"Unknown view {v!r}. Use one of {', '.join(LOOK_ANGLES)} or an [x, y, z] direction.")
+        if not isinstance(v, str) and (len(v) != 3 or not any(v)):
+            return _app_error(f"A view direction is three numbers, not all zero; got {v!r}.")
+    args = {
+        "outdir": str(http_services.category_dir("renders", create=True)),
+        "prefix": f"render_{time.strftime('%Y%m%d_%H%M%S')}",
+        "views": views, "target": target, "distance": distance, "engine": engine,
+        "resolution": resolution, "samples": samples,
+        "max_size": max(0, min(int(max_size or 0), 2000)),
+    }
+    try:
+        info = _run_script(blender_scripts.RENDER, args)
+    except Exception as e:
+        hint = f" {ADDON_UPDATE_HINT}" if _addon_outdated() and ADDON_UPDATE_HINT not in str(e) else ""
+        return _app_error(f"Render failed: {e}{hint}")
+    renders = info.get("renders") or []
+    failed = [r for r in renders if "error" in r]
+    if not renders or len(failed) == len(renders):
+        return _app_error(f"Render produced no images: {failed[0]['error'] if failed else info.get('error', 'unknown failure')}")
+
+    lines, images = [], []
+    for r in renders:
+        if "error" in r:
+            lines.append(f"- {r['view']}: {r['error']}")
+            continue
+        line = f"- {r['view']}: {r['path']} ({r.get('bytes', 0)} bytes)"
+        url = http_services.download_url(r["path"])
+        if url:
+            line += f" | Download: {url}"
+        lines.append(line)
+        preview = r.get("preview")
+        if preview and os.path.isfile(preview):
+            with open(preview, "rb") as f:
+                images.append(_png_content(f.read()))
+    summary = TextContent(
+        type="text",
+        text=f"Rendered with {info.get('engine', 'scene engine')}:\n" + "\n".join(lines))
+    return CallToolResult(content=[summary, *images])
+
+
+@mcp.tool()
+@trajectory_tool("import_file")
+async def import_file(
+    ctx: Context,
+    filepath: str,
+    user_prompt: str = "",
+) -> str:
+    """
+    Import a file from the machine Blender runs on into the scene: models (.glb, .gltf,
+    .fbx, .obj, .ply, .stl, .dae, .abc, .usd*, .svg), other .blend files (their objects
+    are appended), and images or HDRI maps (.png, .jpg, .hdr, .exr, ...).
+
+    For an asset that lives somewhere else, upload it first: POST the raw bytes to the
+    server's /upload/{filename} endpoint (URLs in get_addon_status), then import the
+    path it returns here.
+
+    Parameters:
+    - filepath: Path on Blender's machine, as the upload endpoint reports it.
+    - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
+    """
+    filepath = (filepath or "").strip()
+    if not filepath:
+        return "Error: filepath is required"
+    try:
+        # Not read_only: an import changes the scene, so the Viewport app must
+        # recapture after it.
+        result = get_blender_connection().send_command(
+            "execute_code",
+            {"code": blender_scripts.build(blender_scripts.IMPORT, {"filepath": filepath})})
+        imported = blender_scripts.parse_result(
+            result.get("result", "") if isinstance(result, dict) else "")
+    except Exception as e:
+        hint = f" {ADDON_UPDATE_HINT}" if _addon_outdated() and ADDON_UPDATE_HINT not in str(e) else ""
+        return f"Error importing: {e}{hint}"
+    if imported.get("error"):
+        return f"Error: {imported['error']}"
+    parts = [f"Imported {imported.get('file', filepath)}."]
+    if imported.get("imported"):
+        parts.append("New objects: " + ", ".join(imported["imported"]))
+    if imported.get("images"):
+        parts.append("New images: " + ", ".join(imported["images"]))
+    if not imported.get("imported") and not imported.get("images"):
+        parts.append("Nothing new appeared in the scene.")
+    return "\n".join(parts)
 
 
 def _generation_send(command: str, params: dict):
@@ -2350,31 +2544,44 @@ def _bearer_auth_middleware(app, token):
     Written against raw ASGI rather than BaseHTTPMiddleware because the
     latter re-wraps the response body and interferes with the long-lived
     SSE streams both HTTP transports depend on.
+
+    A matching ?token= query parameter is accepted too, so a browser can open
+    the preview page and download links without setting headers. Tokens in
+    URLs leak into logs and history, so the header stays the recommended form.
     """
     expected = f"Bearer {token}".encode("latin-1")
 
+    def _authorized(scope) -> bool:
+        headers = {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+        }
+        provided = headers.get("authorization", "").encode("latin-1")
+        if hmac.compare_digest(provided, expected):
+            return True
+        for part in scope.get("query_string", b"").decode("latin-1").split("&"):
+            name, _, value = part.partition("=")
+            if name == "token" and hmac.compare_digest(
+                    f"Bearer {unquote(value)}".encode("latin-1"), expected):
+                return True
+        return False
+
     async def middleware(scope, receive, send):
-        if scope["type"] == "http":
-            headers = {
-                k.decode("latin-1").lower(): v.decode("latin-1")
-                for k, v in scope.get("headers", [])
-            }
-            provided = headers.get("authorization", "").encode("latin-1")
-            if not hmac.compare_digest(provided, expected):
-                logger.warning(f"Rejected request with invalid bearer token from {scope.get('client')}")
-                await send({
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [
-                        (b"content-type", b"text/plain"),
-                        (b"www-authenticate", b"Bearer"),
-                    ],
-                })
-                await send({
-                    "type": "http.response.body",
-                    "body": b"Unauthorized: missing or invalid bearer token\n",
-                })
-                return
+        if scope["type"] == "http" and not _authorized(scope):
+            logger.warning(f"Rejected request with invalid bearer token from {scope.get('client')}")
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"text/plain"),
+                    (b"www-authenticate", b"Bearer"),
+                ],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b"Unauthorized: missing or invalid bearer token\n",
+            })
+            return
         await app(scope, receive, send)
 
     return middleware
@@ -2437,11 +2644,24 @@ def _run_http_transport(transport, host, port, stateless_http):
         endpoint = f"http://{host}:{port}/mcp"
         label = "Streamable HTTP"
 
+    if http_services.services_enabled():
+        # Plain HTTP routes next to MCP: preview page, asset upload, result
+        # downloads. Mounted on the bare app before the bearer middleware
+        # wraps it, so the middleware covers these routes too.
+        app.router.routes.extend(http_services.routes())
+        http_services.set_listener(host, port)
+
     if token is not None:
         app = _bearer_auth_middleware(app, token)
         logger.info("Bearer token auth enabled (BLENDER_MCP_HTTP_TOKEN is set)")
 
     logger.info(f"Serving MCP over {label} at {endpoint}")
+    if http_services.active():
+        logger.info(
+            "HTTP services on: /preview /upload /files "
+            f"({http_services.public_base_url()}/preview) "
+            "(disable with BLENDER_MCP_HTTP_SERVICES=0)"
+        )
     uvicorn.run(app, host=host, port=port, log_level=mcp.settings.log_level.lower())
 
 

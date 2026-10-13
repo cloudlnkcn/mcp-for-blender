@@ -549,3 +549,255 @@ for name in ARGS["names"]:
                 "size": [round(hi[i] - lo[i], 3) for i in range(3)]})
 return out
 '''
+
+
+# Import a file from Blender's own filesystem: models by extension (4.x moved
+# the mesh importers to wm.*, 3.x kept import_scene/import_mesh -- try in
+# order), whole objects out of another .blend, and images/HDRI maps as
+# datablocks. Reports what is new, so the caller can place and frame it.
+IMPORT = r'''
+import bpy, os
+
+filepath = bpy.path.abspath(ARGS["filepath"])
+if not os.path.isfile(filepath):
+    return {"error": "No file at " + filepath}
+
+scene = bpy.context.scene
+ext = os.path.splitext(filepath)[1].lower()
+before_objects = set(bpy.data.objects)
+before_images = set(bpy.data.images)
+
+MODEL_OPS = {
+    ".glb": ["import_scene.gltf"], ".gltf": ["import_scene.gltf"],
+    ".fbx": ["import_scene.fbx"],
+    ".obj": ["wm.obj_import", "import_scene.obj"],
+    ".ply": ["wm.ply_import", "import_mesh.ply"],
+    ".stl": ["wm.stl_import", "import_mesh.stl"],
+    ".dae": ["wm.collada_import"], ".abc": ["wm.alembic_import"],
+    ".usd": ["wm.usd_import"], ".usda": ["wm.usd_import"],
+    ".usdc": ["wm.usd_import"], ".usdz": ["wm.usd_import"],
+    ".x3d": ["import_scene.x3d"], ".wrl": ["import_scene.x3d"],
+    ".svg": ["import_curve.svg"],
+}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff",
+              ".webp", ".hdr", ".exr"}
+
+def run(op_path, **kwargs):
+    """Run one bpy.ops operator by dotted name; False when this Blender lacks it."""
+    mod = bpy.ops
+    for part in op_path.split(".")[:-1]:
+        mod = getattr(mod, part)
+    name = op_path.split(".")[-1]
+    if not hasattr(mod, name):
+        return False
+    getattr(mod, name)(**kwargs)
+    return True
+
+if ext in MODEL_OPS:
+    imported = False
+    errors = []
+    for op_path in MODEL_OPS[ext]:
+        try:
+            imported = run(op_path, filepath=filepath)
+        except Exception as e:
+            errors.append(f"{op_path}: {e}")
+        if imported:
+            break
+    if not imported:
+        detail = ("; ".join(errors)) if errors else "this Blender has no importer for it"
+        return {"error": f"Couldn't import {ext} ({detail})"}
+elif ext == ".blend":
+    loaded = []
+    with bpy.data.libraries.load(filepath, link=False) as (src, dst):
+        dst.objects = src.objects
+        loaded = list(dst.objects or [])
+    for o in loaded:
+        if o is not None and not o.users_collection:
+            try:
+                scene.collection.objects.link(o)
+            except Exception:
+                pass
+elif ext in IMAGE_EXTS:
+    try:
+        bpy.data.images.load(filepath, check_existing=False)
+    except Exception as e:
+        return {"error": f"Couldn't load the image: {e}"}
+else:
+    return {"error": f"Unsupported file type '{ext}'. Models: " + ", ".join(sorted(MODEL_OPS)) +
+                    "; images: " + ", ".join(sorted(IMAGE_EXTS)) + "; or a .blend"}
+
+new_objects = sorted(o.name for o in bpy.data.objects if o not in before_objects)
+new_images = sorted(i.name for i in bpy.data.images if i not in before_images)
+return {"file": filepath, "ext": ext, "imported": new_objects, "images": new_images}
+'''
+
+
+# Render the scene from several sides with the scene's own render engine
+# (Cycles included, so the picture is the real final image, not a viewport
+# approximation). Each view gets a temporary camera fitted to the target's
+# bounds; every setting touched is restored, and the temporary cameras are
+# removed. One PNG per view lands in outdir, with a downscaled twin beside it
+# when max_size is set.
+RENDER = r'''
+import bpy, math, os, re
+from mathutils import Vector
+
+scene = bpy.context.scene
+depsgraph = bpy.context.evaluated_depsgraph_get()
+outdir = ARGS["outdir"]
+prefix = ARGS.get("prefix") or "render"
+views = (ARGS.get("views") or ["front", "right", "top", "three_quarter"])[:6]
+max_preview = int(ARGS.get("max_size") or 0)
+os.makedirs(outdir, exist_ok=True)
+
+names = ARGS.get("target") or []
+if names:
+    missing = [n for n in names if n not in bpy.data.objects]
+    if missing:
+        return {"error": "No object named " + ", ".join(missing)}
+    targets = []
+    for n in names:
+        o = bpy.data.objects[n]
+        targets.extend([o] + list(o.children_recursive))
+else:
+    targets = [o for o in scene.objects if o.visible_get() and o.type not in {"CAMERA", "LIGHT"}]
+
+pts = []
+for o in targets:
+    try:
+        ev = o.evaluated_get(depsgraph)
+        pts.extend(ev.matrix_world @ Vector(c) for c in ev.bound_box)
+    except Exception:
+        pts.append(o.matrix_world.translation.copy())
+pts = pts or [Vector((0, 0, 0))]
+lo = Vector([min(p[i] for p in pts) for i in range(3)])
+hi = Vector([max(p[i] for p in pts) for i in range(3)])
+center = (lo + hi) / 2
+radius = max((hi - lo).length / 2, 0.05)
+
+FOV = math.radians(35)
+ANGLE_DIRS = {
+    "front": (0, -1, 0), "back": (0, 1, 0), "right": (1, 0, 0), "left": (-1, 0, 0),
+    "top": (0, -0.001, 1), "three_quarter": (1, -1, 0.7),
+}
+
+def direction_of(v):
+    if isinstance(v, str):
+        return ANGLE_DIRS.get(v)
+    if isinstance(v, (list, tuple)) and len(v) == 3 and any(v):
+        return tuple(float(c) for c in v)
+    return None
+
+def label_of(v):
+    return v if isinstance(v, str) else "(" + ", ".join(f"{float(c):g}" for c in v) + ")"
+
+def safe_label(v):
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", label_of(v)).strip("_") or "view"
+
+def restore_samples(saved):
+    if not saved:
+        return
+    owner, attr, value = saved
+    try:
+        setattr(getattr(scene, owner), attr, value)
+    except Exception:
+        pass
+
+saved_camera = scene.camera
+saved_filepath = scene.render.filepath
+saved_res = (scene.render.resolution_x, scene.render.resolution_y,
+             scene.render.resolution_percentage)
+saved_engine = scene.render.engine
+saved_samples = None
+
+requested_engine = (ARGS.get("engine") or "").strip()
+if requested_engine:
+    known = [i.identifier for i in scene.render.bl_rna.properties["engine"].enum_items]
+    aliases = {"cycles": "CYCLES", "workbench": "BLENDER_WORKBENCH",
+               "eevee": "BLENDER_EEVEE_NEXT" if "BLENDER_EEVEE_NEXT" in known else "BLENDER_EEVEE"}
+    try:
+        scene.render.engine = aliases.get(requested_engine.lower(), requested_engine)
+    except Exception as e:
+        scene.render.engine = saved_engine
+        return {"error": f"Can't set the render engine to {requested_engine!r}: {e}"}
+
+resolution = ARGS.get("resolution") or []
+if len(resolution) == 2 and all(resolution):
+    scene.render.resolution_x, scene.render.resolution_y = int(resolution[0]), int(resolution[1])
+    scene.render.resolution_percentage = 100
+
+samples = ARGS.get("samples")
+if samples is not None:
+    try:
+        if scene.render.engine == "CYCLES" and getattr(scene, "cycles", None):
+            saved_samples = ("cycles", "samples", scene.cycles.samples)
+            scene.cycles.samples = int(samples)
+        elif hasattr(scene, "eevee"):
+            saved_samples = ("eevee", "taa_render_samples", scene.eevee.taa_render_samples)
+            scene.eevee.taa_render_samples = int(samples)
+    except Exception:
+        saved_samples = None
+
+aspect = (scene.render.resolution_x * scene.render.pixel_aspect_x) / \
+         (scene.render.resolution_y * scene.render.pixel_aspect_y)
+fit = FOV / 2 if aspect >= 1 else math.atan(math.tan(FOV / 2) * aspect)
+dist = float(ARGS.get("distance") or 0) or radius / math.sin(fit) * 1.15
+
+created = []
+results = []
+try:
+    for v in views:
+        d = direction_of(v)
+        if d is None:
+            results.append({"view": label_of(v), "error": "unknown view; use front, back, left, right, top, three_quarter or [x, y, z]"})
+            continue
+        eye = center + Vector(d).normalized() * dist
+        rot = (center - eye).to_track_quat("-Z", "Y").to_euler()
+        cam_data = bpy.data.cameras.new(prefix + "_cam")
+        cam_data.angle = FOV
+        cam = bpy.data.objects.new(prefix + "_cam", cam_data)
+        scene.collection.objects.link(cam)
+        created.append((cam, cam_data))
+        cam.location = eye
+        cam.rotation_euler = rot
+        scene.camera = cam
+        label = safe_label(v)
+        out = os.path.join(outdir, f"{prefix}_{label}.png")
+        scene.render.filepath = out
+        bpy.ops.render.render(write_still=True)
+        entry = {"view": label_of(v), "path": out, "bytes": os.path.getsize(out)}
+        if max_preview:
+            img = bpy.data.images.load(out, check_existing=False)
+            try:
+                w, h = img.size
+                s = min(1.0, max_preview / max(w, h))
+                if s < 1.0:
+                    img.scale(max(1, int(w * s)), max(1, int(h * s)))
+                preview_path = os.path.join(outdir, f"{prefix}_{label}_preview.png")
+                img.filepath_raw = preview_path
+                img.file_format = "PNG"
+                img.save()
+                entry["preview"] = preview_path
+                entry["width"], entry["height"] = img.size[0], img.size[1]
+            finally:
+                bpy.data.images.remove(img)
+        results.append(entry)
+finally:
+    scene.camera = saved_camera
+    scene.render.filepath = saved_filepath
+    scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage = saved_res
+    restore_samples(saved_samples)
+    scene.render.engine = saved_engine
+    for cam, cam_data in created:
+        try:
+            bpy.data.objects.remove(cam)
+        except Exception:
+            pass
+        try:
+            bpy.data.cameras.remove(cam_data)
+        except Exception:
+            pass
+
+return {"renders": results, "engine": scene.render.engine,
+        "center": [round(v, 2) for v in center], "size": [round(v, 2) for v in (hi - lo)]}
+'''

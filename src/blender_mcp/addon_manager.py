@@ -171,6 +171,10 @@ class AddonHandshake:
     source: str  # native | missing | error
     warning: str | None = None
     premium_generators: list[str] = field(default_factory=list)
+    # Reported by newer addons so agents know how Blender is localized.
+    # execute_code always runs with new-data-name translation off either way.
+    ui_language: str | None = None
+    translate_new_dataname: bool | None = None
 
 
 def get_bundled_addon_path() -> Path:
@@ -489,6 +493,8 @@ def handshake_addon(blender_connection) -> AddonHandshake:
             source="native",
             warning=warning,
             premium_generators=list(info.get("premium_generators") or []),
+            ui_language=info.get("ui_language"),
+            translate_new_dataname=info.get("translate_new_dataname"),
         )
     except Exception as e:
         msg = str(e).lower()

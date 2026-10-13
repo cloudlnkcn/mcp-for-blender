@@ -1,3 +1,5 @@
+> 🌐 **English** | [简体中文](README.zh-CN.md)
+
 <div align="center">
 
 # MCP for Blender
@@ -187,6 +189,7 @@ The addon starts its server when Blender opens. To check, press `N` in the 3D vi
 | **Object manipulation** | Create, modify, and delete 3D objects in Blender |
 | **Material control** | Apply and modify materials and colors |
 | **Visual verification** | Multi-angle, camera, wireframe, X-ray and animation-strip views, plus renders, so the AI checks its own work |
+| **Browser preview & file transfer** | Over HTTP: a live preview page, asset upload into Blender, and download links for exports and renders |
 | **Code execution** | The AI writes Blender Python directly |
 | **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, and AI-generated 3D models via Tripo, Hyper3D Rodin and Hunyuan3D |
 
@@ -360,6 +363,10 @@ The following environment variables can be used to configure the Blender connect
 | `BLENDER_MCP_HTTP_PORT` | `8000` | Port the HTTP/SSE transport listens on |
 | `BLENDER_MCP_HTTP_STATELESS` | off | Set to `1` to run Streamable HTTP without MCP sessions (for stateless clients/deployments) |
 | `BLENDER_MCP_HTTP_TOKEN` | unset | When set, HTTP/SSE requests must send `Authorization: Bearer <token>` |
+| `BLENDER_MCP_HTTP_SERVICES` | on | Set to `0` to disable the preview/upload/download routes while keeping MCP over HTTP |
+| `BLENDER_MCP_FILES_DIR` | `~/.blender-mcp/files` | Managed directory for `uploads/`, `exports/` and `renders/` |
+| `BLENDER_MCP_PUBLIC_URL` | unset | Base URL advertised for the HTTP services (use when a container port mapping changes host/port) |
+| `BLENDER_MCP_MAX_UPLOAD_MB` | `512` | Upload size limit for `POST /upload/{filename}` |
 | `BLENDER_MCP_SAFE_MODE` | off | Set to `1` to validate scripts before they run in Blender (see below) |
 | `BLENDER_MCP_APPS` | auto | Set to `1` to force the inline viewport app on for clients that support MCP Apps without advertising it (the Codex plugin sets this) |
 | `BLENDER_MCP_OPENAI_FORMS` | auto | Set to `1` to force the thumbnail asset pickers on (the Codex plugin sets this) |
@@ -704,6 +711,50 @@ Publishing the port beyond your host loopback (`-p 8000:8000`) without
 `BLENDER_MCP_HTTP_TOKEN` exposes `execute_blender_code` to your network; see
 [Security](#security) below.
 
+### Preview, upload & download (HTTP services)
+
+Over HTTP the server also mounts plain-HTTP routes next to the MCP endpoint,
+so a browser — or any script — can work with the design without an MCP client
+in the loop:
+
+| Endpoint | What it does |
+|---|---|
+| `GET /preview` | Live page for a human: auto-refreshing viewport screenshot, a **Capture now** button, drag-and-drop asset upload, and the downloads list |
+| `GET /preview/latest.png` | The newest viewport capture as PNG |
+| `POST /preview/capture` | Ask Blender for a fresh screenshot now |
+| `POST /upload/{filename}` | Store an asset next to Blender — send the **raw file bytes** as the body (e.g. `curl --data-binary @model.glb http://127.0.0.1:8000/upload/model.glb`) |
+| `GET /files` | List `uploads/`, `exports/` and `renders/` as JSON |
+| `GET /files/{category}/{name}` | Download one file |
+| `POST /files/uploads/{name}/import` | Import an uploaded file into the scene |
+
+The agent sees these URLs too: `get_addon_status` reports them under
+`http_services`, and `export_scene` / `render_scene` results carry `/files`
+download links — so after finishing a design it can just hand you the preview
+or download URL. Three new tools back this up:
+
+- **`export_scene`** — export the scene, the selection or named objects to
+  GLB/FBX into the managed folder (the addon's `export_scene` command, now
+  reachable as a tool).
+- **`render_scene`** — the real multi-angle render: temporary cameras fitted
+  to the target (front/right/top/three_quarter or custom directions), rendered
+  with the scene's own engine (Cycles included), one full-size PNG per view in
+  the managed folder plus a downscaled copy attached to the result.
+- **`import_file`** — import a file from Blender's machine into the scene:
+  models (`.glb/.gltf/.fbx/.obj/.ply/.stl/.dae/.abc/.usd*/.svg`), other
+  `.blend` files (objects appended), images and HDRI maps.
+
+Files live in one managed directory — `~/.blender-mcp/files` by default, with
+`uploads/`, `exports/` and `renders/` subfolders — because the addon and the
+server are expected to share a filesystem (screenshots travel over temp paths
+the same way). Set `BLENDER_MCP_PUBLIC_URL` when a container port mapping means
+the advertised URLs need a different host or port.
+
+Everything here shares the MCP endpoint's authentication: when
+`BLENDER_MCP_HTTP_TOKEN` is set, these routes accept the token as an
+`Authorization: Bearer` header or, for browser links, as `?token=...` (the
+URLs the server reports already include it). Turn the services off without
+losing MCP-over-HTTP with `BLENDER_MCP_HTTP_SERVICES=0`.
+
 ### Security
 
 The HTTP endpoint exposes every tool, including `execute_blender_code`, which
@@ -793,16 +844,19 @@ Once the config file has been set on Claude, and the addon is running on Blender
 
 ### Capabilities
 
-The AI writes Blender Python itself for modelling, layout, materials, animation, rigging and retopology. The MCP adds what Python can't do on its own, as nine tools:
+The AI writes Blender Python itself for modelling, layout, materials, animation, rigging and retopology. The MCP adds what Python can't do on its own, as twelve tools:
 
 | Tool | What it's for |
 |---|---|
 | `execute_blender_code` | Run Python in your live Blender |
 | `look` | See the result from the `viewport`, `camera`, `angles` (auto-framed multi-view sheet, any direction) or `frames` (animation strip), drawn `solid`, `material`, `rendered`, `wireframe` or `xray`; or show a render or image file |
+| `render_scene` | Real multi-angle renders with the scene's own engine (Cycles included), saved as files with download links |
+| `export_scene` | Export the scene, a selection or named objects to GLB/FBX |
+| `import_file` | Import a model, image or HDRI from Blender's machine (pairs with the HTTP upload endpoint) |
 | `get_scene_info` | Compact scene summary, one line per object with the fields you pick (placement, materials, topology, weights, ...); drill in with `root` or `query` |
 | `generate_3d` | One call to generate and import a model with Tripo, Hunyuan3D or Hyper3D Rodin. Premium generators are preferred automatically |
 | `search_assets` / `import_asset` | [Poly Haven](https://polyhaven.com/) HDRIs, textures and models, [Sketchfab](https://sketchfab.com/) models, [Poly Pizza](https://poly.pizza/) low-poly models |
-| `get_addon_status` | Blender version, addon version, and which libraries and generators are switched on |
+| `get_addon_status` | Blender version, addon version, which libraries and generators are switched on, and the HTTP service URLs when the server runs over HTTP |
 | `disable_telemetry`, `record_trajectory_feedback` | Data collection controls |
 
 #### Hunyuan3D on Tencent Cloud (Official API mode)

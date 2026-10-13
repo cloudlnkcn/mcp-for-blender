@@ -10,6 +10,7 @@ from blender_mcp.openai_apps import is_app_only
 MODEL_TOOLS = {
     "get_addon_status", "disable_telemetry", "get_scene_info", "execute_blender_code",
     "record_trajectory_feedback", "look", "generate_3d", "search_assets", "import_asset",
+    "export_scene", "render_scene", "import_file",
 }
 
 
@@ -33,7 +34,8 @@ def test_guides_are_off_for_now():
 
 def test_scripts_compile_and_never_raise_systemexit():
     # The addon catches Exception around execute_code but not SystemExit.
-    for script in (blender_scripts.SCENE_SUMMARY, blender_scripts.LOOK, blender_scripts.BOUNDS):
+    for script in (blender_scripts.SCENE_SUMMARY, blender_scripts.LOOK, blender_scripts.BOUNDS,
+                   blender_scripts.IMPORT, blender_scripts.RENDER):
         code = blender_scripts.build(script, {"mode": "angles", "target": None, "flag": True, "none": None})
         ast.parse(code)
         assert "SystemExit" not in code and "sys.exit" not in code

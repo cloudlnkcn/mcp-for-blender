@@ -1608,6 +1608,9 @@ class BlenderMCPServer:
                 "set_telemetry_consent",
             ]),
             "blender_version": bpy.app.version_string,
+            "ui_language": getattr(bpy.context.preferences.view, "language", None),
+            "translate_new_dataname": getattr(
+                bpy.context.preferences.view, "use_translate_new_dataname", None),
             "premium_generators": premium_enabled_generators(),
         }
 
@@ -2242,10 +2245,25 @@ class BlenderMCPServer:
             # Create a local namespace for execution
             namespace = {"bpy": bpy}
 
+            # Agent-submitted code addresses data by name ("Principled BSDF",
+            # "Cube", ...). With a localized UI and "Translate New Data" on,
+            # Blender would hand those nodes/objects localized names, breaking
+            # every name-based lookup. Run with the flag off (English names),
+            # whatever the UI language is, and restore it afterwards.
+            view = getattr(bpy.context.preferences, "view", None)
+            flag = "use_translate_new_dataname"
+            prev_translate = getattr(view, flag, None)
+            if prev_translate is not None:
+                setattr(view, flag, False)
+
             # Capture stdout during execution, and return it as result
             capture_buffer = io.StringIO()
-            with redirect_stdout(capture_buffer):
-                exec(code, namespace)
+            try:
+                with redirect_stdout(capture_buffer):
+                    exec(code, namespace)
+            finally:
+                if prev_translate is not None:
+                    setattr(view, flag, prev_translate)
 
             captured_output = capture_buffer.getvalue()
             return {"executed": True, "result": captured_output}
