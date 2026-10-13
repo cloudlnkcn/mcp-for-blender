@@ -1,11 +1,14 @@
 # blender_mcp_server.py
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.transport_security import TransportSecuritySettings
 import argparse
 import socket
 import json
 import logging
 import tempfile
 import threading
+import hmac
+import ipaddress
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any
@@ -57,22 +60,69 @@ logger = logging.getLogger("BlenderMCPServer")
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 
+# HTTP/SSE listener defaults. Deliberately separate from DEFAULT_HOST/PORT
+# above, which are the *Blender* address: when the server runs as an HTTP
+# endpoint it listens on one address (this) while dialing Blender on another.
+# Binds to loopback rather than 0.0.0.0 because the server can execute code
+# in Blender; exposing it is an explicit --http-host 0.0.0.0 decision.
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8000
 
-def parse_connection_args(argv):
-    """Parse --host/--port out of argv, ignoring anything else.
+VALID_TRANSPORTS = ("stdio", "http", "sse")
+# Aliases users (and docs) reach for when they mean streamable HTTP.
+_STREAMABLE_HTTP_ALIASES = {"http", "streamable-http", "streamable_http"}
+_STATELESS_TRUTHY = {"1", "true", "yes", "on"}
+
+
+@dataclass
+class ServerArgs:
+    """Everything the server entry point reads from argv."""
+
+    host: str | None = None
+    port: int | None = None
+    transport: str | None = None
+    http_host: str | None = None
+    http_port: int | None = None
+    stateless_http: bool = False
+
+
+def parse_server_args(argv):
+    """Parse all server flags out of argv, ignoring anything else.
 
     parse_known_args is deliberate: MCP clients sometimes append their own
     arguments to the server command, and an unrecognised one must not abort
     startup. Unknown args are logged rather than dropped silently, so a typo
     like --prot does not masquerade as "connected to the default port".
+
+    allow_abbrev=False keeps that contract intact now that the flag list is
+    longer: argparse's default prefix matching turns a bare `--h` into an
+    ambiguity crash (SystemExit) and silently swallows a client's unrelated
+    `--state ...` as an abbreviation of --stateless-http.
     """
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--transport", default=None)
+    parser.add_argument("--http-host", default=None)
+    parser.add_argument("--http-port", type=int, default=None)
+    parser.add_argument("--stateless-http", action="store_true", default=False)
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         logger.warning(f"Ignoring unrecognized command-line arguments: {unknown}")
-    return args.host, args.port
+    return ServerArgs(
+        host=args.host,
+        port=args.port,
+        transport=args.transport,
+        http_host=args.http_host,
+        http_port=args.http_port,
+        stateless_http=args.stateless_http,
+    )
+
+
+def parse_connection_args(argv):
+    """Parse --host/--port out of argv; the Blender address half of parse_server_args."""
+    server_args = parse_server_args(argv)
+    return server_args.host, server_args.port
 
 
 def resolve_connection(cli_host=None, cli_port=None):
@@ -93,6 +143,76 @@ def resolve_connection(cli_host=None, cli_port=None):
             f"falling back to {DEFAULT_PORT}"
         )
         return host, DEFAULT_PORT
+
+
+def resolve_transport(cli_transport=None):
+    """Resolve the transport: CLI flag > environment > stdio.
+
+    Returns one of "stdio", "streamable-http", "sse" -- the literals
+    FastMCP.run() accepts. An explicitly configured but unknown value exits
+    rather than falling back to stdio: a client pointed at an HTTP URL would
+    just see the server hang, which is far harder to debug than a startup
+    crash naming the bad value.
+    """
+    raw = cli_transport
+    if raw is None or raw == "":
+        raw = os.getenv("BLENDER_MCP_TRANSPORT")
+    if raw is None or raw.strip() == "":
+        return "stdio"
+    normalized = raw.strip().lower()
+    if normalized in _STREAMABLE_HTTP_ALIASES:
+        return "streamable-http"
+    if normalized in VALID_TRANSPORTS:
+        return normalized
+    raise SystemExit(
+        f"Unknown transport {raw!r} (set via --transport or BLENDER_MCP_TRANSPORT). "
+        f"Valid values: stdio, http (aliases: streamable-http, streamable_http), sse"
+    )
+
+
+def resolve_http_listener(cli_host=None, cli_port=None):
+    """Resolve the HTTP/SSE listener address: CLI flags > environment > defaults."""
+    # An env var present but blank must fall back to the default: binding to ""
+    # means all interfaces in asyncio, which would silently defeat the
+    # loopback-by-default posture.
+    env_host = (os.getenv("BLENDER_MCP_HTTP_HOST") or "").strip()
+    host = cli_host or env_host or DEFAULT_HTTP_HOST
+
+    if cli_port is not None:
+        if not _port_in_range(cli_port):
+            raise SystemExit(
+                f"Invalid --http-port {cli_port!r}: must be an integer between 0 and 65535"
+            )
+        return host, cli_port
+
+    raw_port = os.getenv("BLENDER_MCP_HTTP_PORT")
+    if raw_port is None or raw_port == "":
+        return host, DEFAULT_HTTP_PORT
+    try:
+        port = int(raw_port)
+    except ValueError:
+        logger.warning(
+            f"BLENDER_MCP_HTTP_PORT={raw_port!r} is not a valid port number; "
+            f"falling back to {DEFAULT_HTTP_PORT}"
+        )
+        return host, DEFAULT_HTTP_PORT
+    if not _port_in_range(port):
+        logger.warning(
+            f"BLENDER_MCP_HTTP_PORT={raw_port!r} is out of range (0-65535); "
+            f"falling back to {DEFAULT_HTTP_PORT}"
+        )
+        return host, DEFAULT_HTTP_PORT
+    return host, port
+
+
+def _port_in_range(port):
+    return 0 <= port <= 65535
+
+
+def resolve_stateless_http(cli_flag=False):
+    """Stateless mode answers each HTTP request without an MCP session; some
+    remote clients (and every stateless deployment) need it."""
+    return cli_flag or os.getenv("BLENDER_MCP_HTTP_STATELESS", "").strip().lower() in _STATELESS_TRUTHY
 
 
 # Set from --host/--port in main(); these take precedence over the
@@ -2190,6 +2310,141 @@ mcp._mcp_server.list_tools()(_list_tools_for_client)
 
 # Main execution
 
+def _is_loopback_listen_host(host):
+    """True for addresses only this machine can call itself on: 127.0.0.0/8,
+    ::1 (bracketed or not) and the localhost name. Covers everything the
+    loopback allowlist protects, not just the three spellings the SDK guesses."""
+    lowered = host.strip("[]").lower()
+    if lowered == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(lowered).is_loopback
+    except ValueError:
+        return False
+
+
+def _transport_security_for(host):
+    """Pick DNS-rebinding (Host/Origin) settings matching the bind address.
+
+    FastMCP freezes its protection at construction time: the server object is
+    built with the default loopback host, so its loopback-only allowlist would
+    answer every request from a non-loopback client with a baffling 421 once
+    bound to 0.0.0.0. Loopback binds keep that protection (explicitly, not
+    relying on the SDK default); wider binds drop it -- a browser-borne
+    rebinding attack gains nothing there because it cannot know the bearer
+    token, and non-loopback deployments are expected to set one (a warning is
+    logged when they don't).
+    """
+    if _is_loopback_listen_host(host):
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"],
+            allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+        )
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
+def _bearer_auth_middleware(app, token):
+    """Reject HTTP requests without the expected bearer token.
+
+    Written against raw ASGI rather than BaseHTTPMiddleware because the
+    latter re-wraps the response body and interferes with the long-lived
+    SSE streams both HTTP transports depend on.
+    """
+    expected = f"Bearer {token}".encode("latin-1")
+
+    async def middleware(scope, receive, send):
+        if scope["type"] == "http":
+            headers = {
+                k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in scope.get("headers", [])
+            }
+            provided = headers.get("authorization", "").encode("latin-1")
+            if not hmac.compare_digest(provided, expected):
+                logger.warning(f"Rejected request with invalid bearer token from {scope.get('client')}")
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"text/plain"),
+                        (b"www-authenticate", b"Bearer"),
+                    ],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": b"Unauthorized: missing or invalid bearer token\n",
+                })
+                return
+        await app(scope, receive, send)
+
+    return middleware
+
+
+def _resolve_http_token():
+    """Read and validate BLENDER_MCP_HTTP_TOKEN; None means no auth."""
+    raw = os.getenv("BLENDER_MCP_HTTP_TOKEN")
+    if raw is None:
+        return None
+    token = raw.strip()
+    if not token:
+        raise SystemExit(
+            "BLENDER_MCP_HTTP_TOKEN is set but blank; unset it or provide a real token"
+        )
+    if not token.isascii() or not token.isprintable():
+        # Non-ASCII cannot survive the latin-1 header encoding; a control
+        # character (say a pasted newline) would make every request 401
+        # forever, which is miserable to debug.
+        raise SystemExit(
+            "BLENDER_MCP_HTTP_TOKEN must be printable ASCII: HTTP header values "
+            "cannot encode other characters"
+        )
+    return token
+
+
+def _run_http_transport(transport, host, port, stateless_http):
+    """Serve MCP over Streamable HTTP (/mcp) or the legacy SSE (/sse) endpoints.
+
+    Builds the ASGI app directly instead of calling mcp.run(transport=...) so
+    the security settings and the bearer-token middleware can be applied; this
+    mirrors what FastMCP's own run_streamable_http_async/run_sse_async do
+    internally. Settings must be assigned before the app is built: the
+    streamable transport snapshots stateless_http and the Host/Origin rules
+    when streamable_http_app()/sse_app() runs.
+    """
+    import uvicorn
+
+    mcp.settings.host = host
+    mcp.settings.port = port
+
+    token = _resolve_http_token()
+    if not _is_loopback_listen_host(host) and token is None:
+        logger.warning(
+            f"MCP is bound to {host} without a bearer token: anyone who can "
+            f"reach this port can run Python inside Blender. Set "
+            f"BLENDER_MCP_HTTP_TOKEN to require authentication."
+        )
+    mcp.settings.transport_security = _transport_security_for(host)
+
+    if transport == "sse":
+        if stateless_http:
+            logger.warning("--stateless-http has no effect on the sse transport; ignoring it")
+        app = mcp.sse_app()
+        endpoint = f"http://{host}:{port}/sse"
+        label = "SSE"
+    else:
+        mcp.settings.stateless_http = stateless_http
+        app = mcp.streamable_http_app()
+        endpoint = f"http://{host}:{port}/mcp"
+        label = "Streamable HTTP"
+
+    if token is not None:
+        app = _bearer_auth_middleware(app, token)
+        logger.info("Bearer token auth enabled (BLENDER_MCP_HTTP_TOKEN is set)")
+
+    logger.info(f"Serving MCP over {label} at {endpoint}")
+    uvicorn.run(app, host=host, port=port, log_level=mcp.settings.log_level.lower())
+
+
 def main():
     """Run the MCP server, or addon install CLI subcommands."""
     global CLI_HOST, CLI_PORT
@@ -2199,7 +2454,9 @@ def main():
         if code >= 0:
             raise SystemExit(code)
 
-    CLI_HOST, CLI_PORT = parse_connection_args(sys.argv[1:])
+    server_args = parse_server_args(sys.argv[1:])
+    CLI_HOST, CLI_PORT = server_args.host, server_args.port
+    transport = resolve_transport(server_args.transport)
 
     # When run by hand (stdin is a TTY) the server appears to "hang" while it
     # silently waits for an MCP client; log a hint so that state is obvious.
@@ -2209,17 +2466,39 @@ def main():
         interactive = sys.stdin.isatty()
     except (AttributeError, OSError):
         interactive = False
+
+    if transport == "stdio":
+        if interactive:
+            logger.info(
+                "BlenderMCP is an MCP server and is meant to be launched by your MCP "
+                "client (Claude Desktop, Cursor, VS Code, ...), not run by hand. "
+                "It will now wait silently for a client on stdin -- that is normal, "
+                "not a hang. Press Ctrl-C to exit. "
+                "Setup guide: https://github.com/ahujasid/blender-mcp#installation "
+                "(if the addon is outdated this logs how to update it: uvx mcp-for-blender install-addon)"
+            )
+        context_log.install(mcp, SERVER_INSTRUCTIONS)
+        mcp.run()
+        return
+
+    http_host, http_port = resolve_http_listener(server_args.http_host, server_args.http_port)
     if interactive:
+        endpoint_path = "/sse" if transport == "sse" else "/mcp"
         logger.info(
-            "BlenderMCP is an MCP server and is meant to be launched by your MCP "
-            "client (Claude Desktop, Cursor, VS Code, ...), not run by hand. "
-            "It will now wait silently for a client on stdin -- that is normal, "
-            "not a hang. Press Ctrl-C to exit. "
-            "Setup guide: https://github.com/ahujasid/blender-mcp#installation "
-            "(if the addon is outdated this logs how to update it: uvx mcp-for-blender install-addon)"
+            f"BlenderMCP is an MCP server and is meant to be launched by your MCP "
+            f"client, not run by hand. It is now serving MCP over HTTP at "
+            f"http://{http_host}:{http_port}{endpoint_path} -- point your client's "
+            f"url/endpoint setting there. Press Ctrl-C to exit. "
+            f"Setup guide: https://github.com/ahujasid/blender-mcp#installation "
+            f"(if the addon is outdated this logs how to update it: uvx mcp-for-blender install-addon)"
         )
     context_log.install(mcp, SERVER_INSTRUCTIONS)
-    mcp.run()
+    _run_http_transport(
+        transport,
+        http_host,
+        http_port,
+        resolve_stateless_http(server_args.stateless_http),
+    )
 
 if __name__ == "__main__":
     main()

@@ -159,6 +159,7 @@ The addon starts its server when Blender opens. To check, press `N` in the 3D vi
   - [Visual Studio Code](#visual-studio-code)
   - [OpenCode](#opencode)
   - [Antigravity](#antigravity)
+- [HTTP / SSE Transport](#http--sse-transport)
 - [Installing the Blender Addon](#installing-the-blender-addon)
 - [Upgrading (existing users)](#upgrading-existing-users)
 - [Usage](#usage)
@@ -354,6 +355,11 @@ The following environment variables can be used to configure the Blender connect
 |---|---|---|
 | `BLENDER_HOST` | `localhost` | Host address for Blender socket server |
 | `BLENDER_PORT` | `9876` | Port number for Blender socket server |
+| `BLENDER_MCP_TRANSPORT` | `stdio` | MCP transport: `stdio`, `http` (Streamable HTTP) or `sse` (legacy) — see [HTTP / SSE Transport](#http--sse-transport) |
+| `BLENDER_MCP_HTTP_HOST` | `127.0.0.1` | Address the HTTP/SSE transport listens on |
+| `BLENDER_MCP_HTTP_PORT` | `8000` | Port the HTTP/SSE transport listens on |
+| `BLENDER_MCP_HTTP_STATELESS` | off | Set to `1` to run Streamable HTTP without MCP sessions (for stateless clients/deployments) |
+| `BLENDER_MCP_HTTP_TOKEN` | unset | When set, HTTP/SSE requests must send `Authorization: Bearer <token>` |
 | `BLENDER_MCP_SAFE_MODE` | off | Set to `1` to validate scripts before they run in Blender (see below) |
 | `BLENDER_MCP_APPS` | auto | Set to `1` to force the inline viewport app on for clients that support MCP Apps without advertising it (the Codex plugin sets this) |
 | `BLENDER_MCP_OPENAI_FORMS` | auto | Set to `1` to force the thumbnail asset pickers on (the Codex plugin sets this) |
@@ -558,6 +564,164 @@ env = { BLENDER_HOST = "localhost", BLENDER_PORT = "9876" }
   }
 }
 ```
+
+---
+
+## HTTP / SSE Transport
+
+By default the MCP server speaks stdio: your MCP client launches it and talks
+over stdin/stdout. For clients that connect to a URL instead (web-based
+connectors, a server shared by several clients, or one running on another
+machine), start it as an HTTP endpoint:
+
+```bash
+uvx mcp-for-blender --transport http
+# MCP endpoint: http://127.0.0.1:8000/mcp
+```
+
+`http` is [Streamable HTTP](https://modelcontextprotocol.io/docs/concepts/transports#streamable-http),
+the current MCP HTTP transport. Clients that only speak the older SSE
+protocol can be served with `--transport sse` (endpoint
+`http://127.0.0.1:8000/sse`). stdio remains the default, so every existing
+client configuration keeps working unchanged.
+
+Useful flags (each has a `BLENDER_MCP_*` environment variable twin, see
+[Environment Variables](#environment-variables); CLI wins):
+
+| Flag | Default | Description |
+|---|---|---|
+| `--transport` | `stdio` | `stdio`, `http` or `sse` |
+| `--http-host` | `127.0.0.1` | Address to listen on |
+| `--http-port` | `8000` | Port to listen on |
+| `--stateless-http` | off | Run Streamable HTTP without MCP sessions (for stateless clients/deployments) |
+
+Note that `--http-host`/`--http-port` are where the MCP server *listens* —
+they are separate from `--host`/`--port`, which still point at the *Blender*
+socket server.
+
+### Connecting URL-based clients
+
+Point the client's `url` at the endpoint printed on startup:
+
+**Cursor** (`~/.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "blender": {
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}
+```
+
+**Visual Studio Code** (`.vscode/mcp.json`):
+
+```json
+{
+  "servers": {
+    "blender": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}
+```
+
+**Claude for Desktop** (via [mcp-remote](https://www.npmjs.com/package/mcp-remote)):
+
+```json
+{
+  "mcpServers": {
+    "blender": {
+      "command": "npx",
+      "args": ["mcp-remote", "http://127.0.0.1:8000/mcp"]
+    }
+  }
+}
+```
+
+**Codex** (`~/.codex/config.toml`, recent versions):
+
+```toml
+[mcp_servers.blender]
+url = "http://127.0.0.1:8000/mcp"
+```
+
+If you enabled `BLENDER_MCP_HTTP_TOKEN` (see [Security](#security)), send it
+as an `Authorization` header. Most URL-based clients support this natively:
+
+**Cursor:**
+
+```json
+{
+  "mcpServers": {
+    "blender": {
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": { "Authorization": "Bearer <your-token>" }
+    }
+  }
+}
+```
+
+**Visual Studio Code:**
+
+```json
+{
+  "servers": {
+    "blender": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": { "Authorization": "Bearer <your-token>" }
+    }
+  }
+}
+```
+
+**Claude for Desktop via mcp-remote:** add
+`"--header", "Authorization: Bearer <your-token>"` to the `args` above.
+
+### Running the HTTP transport in Docker
+
+Inside a container the server still binds `127.0.0.1`, which `-p` port
+publishing cannot reach — so tell it to bind the container's interface, and
+publish the port to *your* loopback to keep it private to this machine:
+
+```bash
+docker run --rm -p 127.0.0.1:8000:8000 -e BLENDER_MCP_HTTP_HOST=0.0.0.0 \
+    mcp-for-blender --transport http
+```
+
+On Linux, host networking is the simpler route (the container then shares the
+host's loopback, so the default bind works and the Blender addon is reachable
+without extra flags — see [Run with Docker](#run-with-docker)):
+
+```bash
+docker run --rm --network=host mcp-for-blender --transport http
+```
+
+Publishing the port beyond your host loopback (`-p 8000:8000`) without
+`BLENDER_MCP_HTTP_TOKEN` exposes `execute_blender_code` to your network; see
+[Security](#security) below.
+
+### Security
+
+The HTTP endpoint exposes every tool, including `execute_blender_code`, which
+runs arbitrary Python inside Blender. There is no authentication by default:
+
+- It binds to `127.0.0.1` — keep it that way unless you understand the risk.
+  Loopback binds also keep the MCP SDK's DNS-rebinding (Host/Origin) checks
+  enabled; binding a wider address relaxes those checks in favor of the
+  bearer token, and the server logs a warning at startup if you bind beyond
+  loopback without setting a token.
+- To expose it beyond loopback, set `BLENDER_MCP_HTTP_TOKEN` (a long random
+  string) and give clients the token: the server then rejects any request
+  without `Authorization: Bearer <token>`, and failed attempts are logged.
+  There is no TLS — the token travels unencrypted on every request — so only
+  use it over networks you trust (loopback, LAN, VPN), and prefer an SSH
+  tunnel for remote access.
+- Anyone who can reach the endpoint can run Python in Blender, so an open
+  port on an untrusted network is equivalent to handing over your machine.
 
 ---
 

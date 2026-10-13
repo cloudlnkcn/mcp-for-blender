@@ -537,6 +537,9 @@ def run_cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mcp-for-blender",
         description="MCP for Blender server and addon installer",
+        # Match parse_server_args: no prefix guessing, so a client's stray
+        # flag can never be mistaken for one of ours.
+        allow_abbrev=False,
     )
     # Declared here only so they show up in `mcp-for-blender --help`; the server
     # entry point parses them itself (see server.parse_connection_args), since
@@ -552,6 +555,31 @@ def run_cli(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Port of the Blender socket server (overrides BLENDER_PORT)",
+    )
+    # Same deal: parsed by server.parse_server_args, declared here for --help.
+    parser.add_argument(
+        "--transport",
+        type=str,
+        default=None,
+        help="MCP transport: stdio (default), http (Streamable HTTP), or sse (legacy)",
+    )
+    parser.add_argument(
+        "--http-host",
+        type=str,
+        default=None,
+        help="Address the HTTP/SSE transport listens on (overrides BLENDER_MCP_HTTP_HOST, default 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=None,
+        help="Port the HTTP/SSE transport listens on (overrides BLENDER_MCP_HTTP_PORT, default 8000)",
+    )
+    parser.add_argument(
+        "--stateless-http",
+        action="store_true",
+        default=False,
+        help="Run Streamable HTTP without MCP sessions (for stateless clients/deployments)",
     )
     sub = parser.add_subparsers(dest="command")
 

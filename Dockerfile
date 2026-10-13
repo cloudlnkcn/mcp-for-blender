@@ -21,4 +21,10 @@ ENV PATH="/app/.venv/bin:$PATH"
 ENV BLENDER_HOST=host.docker.internal \
     BLENDER_PORT=9876
 
+# Only used with the HTTP transport; stdio, the default transport, needs no
+# ports. The server binds 127.0.0.1 inside the container, which -p publishing
+# cannot reach — pass -e BLENDER_MCP_HTTP_HOST=0.0.0.0 with -p, or use
+# --network=host (see README, HTTP / SSE Transport).
+EXPOSE 8000
+
 ENTRYPOINT ["mcp-for-blender"]
